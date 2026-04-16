@@ -44,6 +44,7 @@ class Segment:
     rotation: int = 0
     char_budget: int | None = None
     review_flags: list[str] = field(default_factory=list)
+    block_id: str | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -86,6 +87,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run-json", help="Write extracted + endpoint-translated segments as JSON and do not write PDF")
     parser.add_argument("--translations-json", help="Use reviewed/caller-translated JSON instead of calling an LLM")
     parser.add_argument("--bbox-pad", type=float, default=0.75, help="Points added around each text bbox for insertion")
+    parser.add_argument(
+        "--fit-scope",
+        choices=("line", "block"),
+        default="line",
+        help="Fit translations per extracted line (default) or per text block for uniform font size across multi-line paragraphs",
+    )
     parser.add_argument(
         "--redact-pad",
         type=float,
@@ -288,9 +295,12 @@ def extract_segments(pdf_path: str, page_selection: str | None, skip_patterns: l
         page = doc[page_index]
         data = page.get_text("dict")
         line_no = 0
+        block_no = 0
         for block in data.get("blocks", []):
             if block.get("type") != 0:
                 continue
+            block_id = f"p{page_index + 1:04d}-b{block_no:04d}"
+            block_no += 1
             for line in block.get("lines", []):
                 spans = [span for span in line.get("spans", []) if normalize_ws(span.get("text", ""))]
                 if not spans:
@@ -316,6 +326,7 @@ def extract_segments(pdf_path: str, page_selection: str | None, skip_patterns: l
                         rotation=rotation,
                         char_budget=char_budget,
                         review_flags=build_review_flags(text, font_size, char_budget),
+                        block_id=block_id,
                     )
                 )
                 line_no += 1
@@ -596,6 +607,7 @@ def load_segments_json(path: str) -> list[Segment]:
         item.setdefault("rotation", 0)
         item.setdefault("char_budget", None)
         item.setdefault("review_flags", build_review_flags(str(item.get("text", "")), float(item.get("font_size", 9.0)), item.get("char_budget")))
+        item.setdefault("block_id", None)
         segments.append(Segment(**item))
     return segments
 
@@ -1014,6 +1026,46 @@ def insert_fitted_text(
     return False, min_size, max_box_scale
 
 
+
+
+def union_padded_rect(segments: list[Segment], pad: float) -> Any:
+    require_fitz()
+    rect = padded_rect(segments[0].bbox, pad)
+    for segment in segments[1:]:
+        rect |= padded_rect(segment.bbox, pad)
+    return rect
+
+
+def block_groups_for_page(page_segments: list[Segment]) -> list[list[Segment]]:
+    groups: dict[str, list[Segment]] = {}
+    order: list[str] = []
+    for segment in page_segments:
+        if segment.skipped:
+            continue
+        key = segment.block_id or segment.id
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(segment)
+    return [groups[key] for key in order]
+
+
+def block_text_for(group: list[Segment]) -> str:
+    return "\n".join(normalize_ws(segment.translation or segment.text) for segment in group if normalize_ws(segment.translation or segment.text))
+
+
+def block_base_size(group: list[Segment]) -> float:
+    return max((segment.font_size for segment in group), default=9.0)
+
+
+def block_color(group: list[Segment]) -> tuple[float, float, float]:
+    return group[0].color if group else (0.0, 0.0, 0.0)
+
+
+def block_rotation(group: list[Segment]) -> int:
+    rotations = {segment.rotation for segment in group}
+    return group[0].rotation if len(rotations) == 1 and group else 0
+
 def apply_translations(input_pdf: str, output_pdf: str, segments: list[Segment], args: argparse.Namespace) -> list[str]:
     require_fitz()
     doc = fitz.open(input_pdf)
@@ -1050,7 +1102,6 @@ def apply_translations(input_pdf: str, output_pdf: str, segments: list[Segment],
             untranslated_reason = likely_untranslated_reason(segment, args.target_language)
             if untranslated_reason:
                 warnings.append(f"{segment.id}: QA possible untranslated text: {untranslated_reason}; source={segment.text!r}; translation={translation!r}")
-            rect = padded_rect(segment.bbox, args.bbox_pad)
             if contains_non_latin(translation) and not fontfile:
                 warnings.append(
                     f"{segment.id}: translation contains non-Latin characters; pass --fontfile /path/to/font.ttf or --fontfile auto if glyphs render incorrectly"
@@ -1059,6 +1110,45 @@ def apply_translations(input_pdf: str, output_pdf: str, segments: list[Segment],
                 warnings.append(
                     f"{segment.id}: translation contains CJK text but fontfile may not cover CJK glyphs: {fontfile}"
                 )
+
+        if args.fit_scope == "block":
+            for group in block_groups_for_page(page_segments):
+                text = block_text_for(group)
+                if not text:
+                    continue
+                rect = union_padded_rect(group, args.bbox_pad)
+                ok, used_size, used_scale = insert_fitted_text(
+                    page,
+                    rect,
+                    text,
+                    block_base_size(group),
+                    args.min_font_size,
+                    block_color(group),
+                    fontname,
+                    fontfile,
+                    block_rotation(group),
+                    args.max_box_scale,
+                )
+                group_id = group[0].block_id or group[0].id
+                if len(group) > 1:
+                    warnings.append(f"{group_id}: inserted {len(group)} lines as one block with uniform font size {used_size:.1f}pt")
+                if used_scale > 1.0:
+                    warnings.append(f"{group_id}: expanded block around original center by {used_scale:.2f}x to fit translation")
+                source_size = block_base_size(group)
+                if source_size > 0 and used_size / source_size < args.warn_font_scale:
+                    warnings.append(
+                        f"{group_id}: block font shrank to {used_size:.1f}pt from source {source_size:.1f}pt; "
+                        "shorten translations or increase --max-box-scale"
+                    )
+                if not ok:
+                    warnings.append(f"{group_id}: block translation may not fit box at min font size {used_size}: {text!r}")
+            continue
+
+        for segment in page_segments:
+            if segment.skipped:
+                continue
+            translation = segment.translation or segment.text
+            rect = padded_rect(segment.bbox, args.bbox_pad)
             ok, used_size, used_scale = insert_fitted_text(
                 page,
                 rect,

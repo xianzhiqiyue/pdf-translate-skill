@@ -1,6 +1,6 @@
 ---
 name: pdf-translate
-version: 0.1.5
+version: 0.1.6
 category: docs
 tags:
   - docs
@@ -285,6 +285,22 @@ A skill package can technically carry a Chinese font, but this package does **no
 
 If no bundled or system font can render Chinese, the script fails before writing the PDF rather than producing `?` text.
 
+
+## Multi-line paragraphs and uniform font size
+
+PDFs usually do not contain editable semantic paragraphs. They contain positioned drawing commands, so this skill generally cannot safely “directly replace the original text object” the way a word processor would. The reliable method is still: redact source glyph areas, then insert new text.
+
+For multi-line paragraphs, per-line fitting can make each translated line use a different font size. When uniform sizing matters more than preserving each individual line position, apply translations with block fitting:
+
+```bash
+python3 scripts/pdf_translate_overlay.py input.pdf translated.pdf \
+  --to-english \
+  --translations-json /tmp/pdf-label-translations.json \
+  --fit-scope block
+```
+
+`--fit-scope block` groups extracted lines from the same PDF text block, redacts the original line areas, and inserts all translated lines into one union textbox with a single fitted font size. This is better for paragraphs and multi-line notes, but it may be worse for engineering labels/callouts that rely on exact per-line positioning. Default remains `--fit-scope line` for precise label replacement.
+
 ## Font readiness for non-Latin output
 
 PDF insertion only works well when the selected font contains glyphs for the translated language. Built-in Helvetica is fine for English and many Latin-script targets, but it does not cover Chinese/Japanese/Korean or many other scripts. Before applying translations to a non-Latin target:
@@ -337,6 +353,7 @@ Important options:
 - `--warn-font-scale 0.6` warns when inserted text shrinks below 60% of source font size.
 - `--redact-fill auto` samples the surrounding background; pass a hex color such as `--redact-fill '#F3F3F3'` when auto sampling is wrong.
 - `--preset {to-english,zh-to-en,to-chinese,en-to-zh}`, `--to-english`, and `--to-chinese` apply common replacement defaults so users do not need to choose layout parameters.
+- `--fit-scope line|block` controls fitting granularity. `line` preserves each line's placement; `block` gives multi-line text in one PDF text block a uniform fitted font size.
 - `--fontfile /path/to/font.ttf` embeds a font that can render non-Latin target languages such as Chinese, Japanese, Korean, Arabic, Devanagari, Thai, Hebrew, Cyrillic, or Greek; if omitted, the script auto-selects a matching bundled/system font whenever translated text needs one. `--fontfile auto` makes this explicit.
 - `--allow-missing-glyphs` bypasses the missing-font failure for debugging only; output may render as `?` or tofu boxes.
 - `--keep-original` overlays translations without removing original text; use only for debugging.
