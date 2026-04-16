@@ -1,6 +1,6 @@
 ---
 name: pdf-translate
-version: 0.1.1
+version: 0.1.2
 category: docs
 tags:
   - docs
@@ -34,8 +34,10 @@ Use this skill for PDFs where text position matters (figure labels, image annota
    - If the document is technical or professional, create a small glossary/instructions file and pass it with `--glossary` and/or `--instructions`.
 4. Run the bundled script in extraction mode to produce a translation JSON template.
 5. Use the current assistant's AI ability to fill `translation` values in that JSON, preserving segment ids, boxes, skip flags, and concise terminology.
-6. Apply the reviewed JSON with the bundled script to overlay text in-place.
-7. Inspect the output PDF visually and with extraction logs. Re-run with skip rules or glossary improvements if labels are mistranslated or too long for boxes.
+6. Check font readiness before applying translations.
+   - If the target language or translated text uses Chinese/Japanese/Korean, Arabic, Devanagari/Hindi, Thai, Hebrew, Cyrillic, Greek, or another non-Latin script, install a supporting font and use `--fontfile auto` or pass a known `.ttf/.otf/.ttc` file.
+7. Apply the reviewed JSON with the bundled script to overlay text in-place.
+8. Inspect the output PDF visually and with extraction logs. Re-run with skip rules, glossary improvements, or a better font if labels are mistranslated, clipped, or rendered as missing glyph boxes.
 
 ## Quick start
 
@@ -53,6 +55,8 @@ Then, as the invoking AI assistant, edit `/tmp/pdf-label-translations.json`:
 - For each non-skipped segment, replace `translation` with a concise target-language translation.
 - For skipped segments, keep `translation` equal to the original `text`.
 - Preserve `id`, `page`, `bbox`, `font_size`, `rotation`, `char_budget`, and skip metadata exactly.
+
+Before applying, read `recommended_args.fontfile`, `recommended_args.font_scripts`, and `recommended_args.font_install_hint`. If the target output is non-Latin and the system lacks a suitable font, install one first or pass an explicit font path.
 
 Apply the reviewed translations without making any external AI API call:
 
@@ -100,6 +104,7 @@ Assistant translation instructions:
 3. Write the translated text to the same segment's `translation` field.
 4. Keep skipped, numeric-only, model names, units, symbols, figure numbers, standards, citations, and user-specified no-translate terms unchanged.
 5. Keep translations concise enough to fit the original label/callout box.
+6. If the translations contain non-Latin text, ensure a matching font is installed before applying.
 
 Then apply the reviewed translations without another AI call:
 
@@ -148,7 +153,9 @@ Decision rules:
 | --- | --- |
 | User did not specify target language | Use `--target-language English`. |
 | Target is English or another Latin-script language | Usually omit `--fontfile`; built-in Helvetica is portable. |
-| Target is Chinese/Japanese/Korean or output contains non-Latin glyphs | Add `--fontfile auto`, or pass a known font such as Noto Sans CJK / Source Han Sans. |
+| Target is Chinese/Japanese/Korean or output contains CJK glyphs | Install a CJK-capable font if missing, then add `--fontfile auto`, or pass a known font such as Noto Sans CJK / Source Han Sans. |
+| Target is Arabic/Persian/Urdu, Devanagari/Hindi, Thai, Hebrew, Cyrillic, Greek, or another non-Latin script | Install a matching Noto/DejaVu/Liberation-family font if missing, then use `--fontfile auto` or an explicit font path. Inspect complex scripts visually. |
+| `recommended_args.font_scripts` is non-empty | Treat `recommended_args.font_install_hint` as a preflight checklist before applying translations. |
 | `recommended_args.min_font_size` is `3.5` | Use `--min-font-size 3.5`; many label boxes are tight. |
 | `recommended_args.max_box_scale` is above `1.0` | Use that value if slight centered expansion is acceptable; keep `1.0` for strict no-expansion placement. |
 | `recommended_args.skip_regex_suggestions` contains patterns | Consider adding those `--skip-regex` values for drawing grid letters, pure numbers, dates, or title-block fields that should stay unchanged. |
@@ -206,6 +213,41 @@ python3 scripts/pdf_translate_overlay.py input.pdf translated.pdf \
   --translations-json /tmp/pdf-label-translations.json
 ```
 
+## Font readiness for non-Latin output
+
+PDF insertion only works well when the selected font contains glyphs for the translated language. Built-in Helvetica is fine for English and many Latin-script targets, but it does not cover Chinese/Japanese/Korean or many other scripts. Before applying translations to a non-Latin target:
+
+1. Read `recommended_args.font_scripts` and `recommended_args.font_install_hint` in the extraction JSON.
+2. Install an appropriate font if the machine does not already have one.
+3. Apply with `--fontfile auto`, or pass a known font path.
+4. Inspect the output PDF for tofu boxes (`□`), missing glyphs, incorrect shaping, or clipped text.
+
+Examples:
+
+```bash
+# Ubuntu/Debian, Chinese/Japanese/Korean
+sudo apt-get update && sudo apt-get install -y fonts-noto-cjk
+
+# Ubuntu/Debian, broad non-Latin coverage such as Arabic/Hebrew/Cyrillic/Greek
+sudo apt-get update && sudo apt-get install -y fonts-noto-core fonts-noto-extra
+
+# Apply after installing fonts
+python3 scripts/pdf_translate_overlay.py input.pdf translated.pdf \
+  --translations-json /tmp/pdf-label-translations.json \
+  --fontfile auto
+```
+
+For manual font selection, use a real font file such as:
+
+- CJK: `NotoSansCJK-Regular.ttc`, `NotoSansSC-Regular.otf`, Source Han Sans.
+- Arabic/Persian/Urdu: Noto Sans Arabic, Noto Naskh Arabic, Amiri.
+- Devanagari/Hindi: Noto Sans Devanagari.
+- Thai: Noto Sans Thai.
+- Hebrew: Noto Sans Hebrew or DejaVu Sans.
+- Cyrillic/Greek: Noto Sans, DejaVu Sans, or Liberation Sans.
+
+If `--fontfile auto` cannot find a suitable font, the script prints installation hints and still writes the PDF; treat that output as needing manual inspection or rerun after installing fonts.
+
 ## Position-preservation guidance
 
 The script translates by text line, not by paragraph, because labels and callouts usually depend on exact local placement. It redacts the original text rectangle and inserts the translation into the same rectangle, shrinking font size when needed. The default redaction fill is `auto`, which samples the local background color instead of always painting white. The extractor records 0/90/180/270-degree line rotation and the writer reuses that rotation when inserting translations. Inserted text uses Helvetica by default, which is suitable for English and many Latin-script targets; pass `--fontfile` or `--fontfile auto` for CJK or other scripts that require a specific font.
@@ -219,7 +261,7 @@ Important options:
 - `--max-box-scale 1.3` permits centered expansion around the original bbox for translations that cannot fit after shrinking; keep at `1.0` for strict no-expansion placement.
 - `--bbox-pad 0.75` expands each source box slightly before redaction/insertion.
 - `--redact-fill auto` samples the surrounding background; pass a hex color such as `--redact-fill '#F3F3F3'` when auto sampling is wrong.
-- `--fontfile /path/to/font.ttf` embeds a font that can render non-Latin target languages such as Chinese, Japanese, or Korean; `--fontfile auto` tries local common Unicode fonts and warns if it may not cover CJK.
+- `--fontfile /path/to/font.ttf` embeds a font that can render non-Latin target languages such as Chinese, Japanese, Korean, Arabic, Devanagari, Thai, Hebrew, Cyrillic, or Greek; `--fontfile auto` tries local script-specific fonts and prints install hints when none are found.
 - `--keep-original` overlays translations without removing original text; use only for debugging.
 
 Read `references/pdf-positioning.md` before handling dense figures, colored backgrounds, vertical labels, or documents with strict publication-quality layout requirements.
@@ -229,7 +271,7 @@ Read `references/pdf-positioning.md` before handling dense figures, colored back
 - Colored or image backgrounds: keep the default `--redact-fill auto` so each source bbox samples its local background. If the sampled color is visibly wrong on gradients or photographs, rerun the affected pages with a manual hex fill or use `--keep-original` for a diagnostic overlay. Exact image inpainting is outside this script; use manual post-editing for publication-critical photo backgrounds.
 - Rotated/vertical labels: the script now detects line direction and preserves 0/90/180/270-degree rotation when inserting translations. Inspect arbitrary-angle text manually because PDF text boxes only support right-angle insertion.
 - Long translations: each segment includes a per-label `char_budget` estimate. Use concise glossary entries, keep caller-generated translations short, edit translations manually, lower `--min-font-size` if fit matters more than readability, or allow bounded expansion with `--max-box-scale 1.2` to keep the label centered on the original position.
-- Missing glyphs: pass `--fontfile /path/to/NotoSansCJK-Regular.ttc` or `--fontfile auto` for non-Latin targets. If warnings say the selected font may not cover CJK, install/use a CJK font and rerun from the reviewed JSON.
+- Missing glyphs: pass `--fontfile /path/to/NotoSansCJK-Regular.ttc` or `--fontfile auto` for non-Latin targets. If warnings say the selected font may not cover the target script, install/use a matching font and rerun from the reviewed JSON.
 - Exact typography: the script preserves placement and color, not the source font. For final print layout, inspect and optionally post-edit high-value pages.
 
 ## Validation checklist

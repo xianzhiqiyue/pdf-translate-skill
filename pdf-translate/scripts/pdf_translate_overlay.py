@@ -82,7 +82,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-font-size", type=float, default=5.0, help="Smallest font size used to fit translations")
     parser.add_argument("--redact-fill", default="auto", help="Hex fill or auto to sample local background (default: auto)")
     parser.add_argument("--fontname", default="helv", help="PDF font resource name for inserted text (default: helv)")
-    parser.add_argument("--fontfile", help="Optional TrueType/OpenType font file, or auto to find a local broad Unicode font")
+    parser.add_argument(
+        "--fontfile",
+        help=(
+            "Optional TrueType/OpenType font file, or auto to find a local font suitable for the target/translated script. "
+            "Use auto or an explicit font for Chinese/Japanese/Korean, Arabic, Devanagari, Thai, Hebrew, Cyrillic, Greek, etc."
+        ),
+    )
     parser.add_argument("--keep-original", action="store_true", help="Overlay translations without redacting source text")
     parser.add_argument("--temperature", type=float, default=0.1, help="LLM temperature")
     parser.add_argument("--timeout", type=int, default=120, help="LLM HTTP timeout seconds")
@@ -399,7 +405,8 @@ def recommend_args(segments: list[Segment], target_language: str) -> dict[str, A
     long_lines = has_long_lines(segments)
     rotated = has_rotated_segments(segments)
     source_cjk_ratio = cjk_ratio(segments)
-    target_is_cjk = bool(re.search(r"chinese|中文|japanese|日文|日语|korean|韩文|韩语", target_language, re.I))
+    target_scripts = script_requirements_for_language(target_language)
+    target_needs_external_font = bool(target_scripts)
 
     min_font_size = 3.5 if tight else 5.0
     if tight:
@@ -421,13 +428,17 @@ def recommend_args(segments: list[Segment], target_language: str) -> dict[str, A
         "min_font_size": min_font_size,
         "max_box_scale": max_box_scale,
         "bbox_pad": 0.75,
-        "fontfile": "auto" if target_is_cjk else None,
+        "fontfile": "auto" if target_needs_external_font else None,
+        "font_scripts": sorted(target_scripts),
+        "font_install_hint": font_install_hint(target_scripts),
         "review_translations_json": True,
         "skip_regex_suggestions": build_skip_regex_suggestions(segments),
         "reason": reasons or ["Default position-preserving settings are suitable."],
     }
-    if target_is_cjk:
-        recommended["reason"].append("Target language may require non-Latin glyphs; use --fontfile auto or a known CJK font.")
+    if target_needs_external_font:
+        recommended["reason"].append(
+            "Target language may require fonts beyond built-in Helvetica; install a supporting font and use --fontfile auto or a known font file."
+        )
     return recommended
 
 
@@ -537,6 +548,67 @@ def contains_non_latin(text: str) -> bool:
     return any(ord(char) > 0x024F for char in text)
 
 
+def script_requirements_for_language(target_language: str) -> set[str]:
+    value = target_language.lower()
+    checks = {
+        "cjk": r"chinese|mandarin|cantonese|中文|汉语|漢語|日文|日语|japanese|korean|韩文|韩语|한국|조선|cjk",
+        "arabic": r"arabic|عربي|persian|farsi|فارسی|urdu|اردو",
+        "devanagari": r"hindi|हिन्दी|devanagari|sanskrit|marathi|nepali",
+        "thai": r"thai|ภาษาไทย|泰文|泰语",
+        "hebrew": r"hebrew|עברית|希伯来",
+        "cyrillic": r"russian|русский|ukrainian|україн|bulgarian|serbian|cyrillic|俄文|俄语",
+        "greek": r"greek|ελλην|希腊",
+    }
+    return {script for script, pattern in checks.items() if re.search(pattern, value, re.I)}
+
+
+def script_requirements_for_text(text: str) -> set[str]:
+    scripts: set[str] = set()
+    for char in text:
+        code = ord(char)
+        if (
+            0x3400 <= code <= 0x9FFF
+            or 0xF900 <= code <= 0xFAFF
+            or 0x3040 <= code <= 0x30FF
+            or 0xAC00 <= code <= 0xD7AF
+        ):
+            scripts.add("cjk")
+        elif 0x0600 <= code <= 0x06FF or 0x0750 <= code <= 0x077F or 0x08A0 <= code <= 0x08FF:
+            scripts.add("arabic")
+        elif 0x0900 <= code <= 0x097F:
+            scripts.add("devanagari")
+        elif 0x0E00 <= code <= 0x0E7F:
+            scripts.add("thai")
+        elif 0x0590 <= code <= 0x05FF:
+            scripts.add("hebrew")
+        elif 0x0400 <= code <= 0x052F:
+            scripts.add("cyrillic")
+        elif 0x0370 <= code <= 0x03FF:
+            scripts.add("greek")
+    return scripts
+
+
+def script_display_name(script: str) -> str:
+    return {
+        "cjk": "Chinese/Japanese/Korean",
+        "arabic": "Arabic/Persian/Urdu",
+        "devanagari": "Devanagari/Hindi",
+        "thai": "Thai",
+        "hebrew": "Hebrew",
+        "cyrillic": "Cyrillic",
+        "greek": "Greek",
+    }.get(script, script)
+
+
+def required_scripts_for_segments(segments: list[Segment], target_language: str = "") -> set[str]:
+    scripts = script_requirements_for_language(target_language)
+    for segment in segments:
+        if segment.skipped:
+            continue
+        scripts.update(script_requirements_for_text(segment.translation or ""))
+    return scripts
+
+
 def contains_cjk(text: str) -> bool:
     return any(
         "\u3400" <= char <= "\u9fff"
@@ -553,42 +625,179 @@ def font_name_looks_cjk(path: str | None) -> bool:
     return bool(re.search(r"CJK|SourceHan|NotoSans[STJKC]|NotoSerif[STJKC]|WenQuan|wqy|DroidSansFallback", path, re.I))
 
 
-def find_auto_fontfile() -> str | None:
-    candidates = [
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
-        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/noto/NotoSansSC-Regular.otf",
-        "/usr/share/fonts/opentype/source-han-sans/SourceHanSansSC-Regular.otf",
-        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-    ]
+def font_name_looks_suitable(path: str | None, script: str) -> bool:
+    if not path:
+        return False
+    patterns = {
+        "cjk": r"CJK|SourceHan|NotoSans[STJKC]|NotoSerif[STJKC]|WenQuan|wqy|DroidSansFallback|PingFang|Hiragino|YuGoth",
+        "arabic": r"Arabic|Naskh|Kufi|Amiri|Scheherazade|DejaVuSans|NotoSans-Regular",
+        "devanagari": r"Devanagari|Lohit-Devanagari|Mangal|Kokila",
+        "thai": r"Thai|Garuda|Laksaman|Norasi|Tlwg",
+        "hebrew": r"Hebrew|David|Miriam|DejaVuSans|NotoSans-Regular",
+        "cyrillic": r"Cyrillic|DejaVuSans|NotoSans-Regular|LiberationSans",
+        "greek": r"Greek|DejaVuSans|NotoSans-Regular|LiberationSans",
+    }
+    return bool(re.search(patterns.get(script, r"Noto|DejaVu|Liberation"), path, re.I))
+
+
+def font_install_hint(required_scripts: set[str]) -> str:
+    scripts = sorted(required_scripts)
+    if not scripts:
+        return "No extra font package is usually required for English/Latin output with built-in Helvetica."
+    apt_packages: set[str] = set()
+    dnf_packages: set[str] = set()
+    brew_packages: set[str] = set()
+    manual_names: set[str] = set()
+    for script in scripts:
+        if script == "cjk":
+            apt_packages.add("fonts-noto-cjk")
+            dnf_packages.add("google-noto-sans-cjk-fonts")
+            brew_packages.add("font-noto-sans-cjk")
+            manual_names.add("Noto Sans CJK / Source Han Sans")
+        elif script == "arabic":
+            apt_packages.update({"fonts-noto-core", "fonts-noto-extra"})
+            dnf_packages.add("google-noto-sans-arabic-fonts")
+            brew_packages.add("font-noto-sans-arabic")
+            manual_names.add("Noto Sans Arabic / Amiri")
+        elif script == "devanagari":
+            apt_packages.update({"fonts-noto-core", "fonts-deva-extra"})
+            dnf_packages.add("google-noto-sans-devanagari-fonts")
+            brew_packages.add("font-noto-sans-devanagari")
+            manual_names.add("Noto Sans Devanagari")
+        elif script == "thai":
+            apt_packages.update({"fonts-noto-core", "fonts-thai-tlwg"})
+            dnf_packages.add("google-noto-sans-thai-fonts")
+            brew_packages.add("font-noto-sans-thai")
+            manual_names.add("Noto Sans Thai")
+        elif script == "hebrew":
+            apt_packages.add("fonts-noto-core")
+            dnf_packages.add("google-noto-sans-hebrew-fonts")
+            brew_packages.add("font-noto-sans-hebrew")
+            manual_names.add("Noto Sans Hebrew")
+        elif script in {"cyrillic", "greek"}:
+            apt_packages.add("fonts-noto-core")
+            dnf_packages.add("google-noto-sans-fonts")
+            brew_packages.add("font-noto-sans")
+            manual_names.add("Noto Sans / DejaVu Sans")
+    return (
+        f"Required scripts: {', '.join(script_display_name(script) for script in scripts)}. "
+        f"Install a supporting font before applying translations, e.g. Ubuntu/Debian: "
+        f"sudo apt-get update && sudo apt-get install -y {' '.join(sorted(apt_packages))}; "
+        f"Fedora/RHEL: sudo dnf install -y {' '.join(sorted(dnf_packages))}; "
+        f"macOS Homebrew: brew install --cask {' '.join(sorted(brew_packages))}; "
+        f"Windows/manual: install {', '.join(sorted(manual_names))}, then pass the .ttf/.otf/.ttc path with --fontfile."
+    )
+
+
+def font_candidates_for_script(script: str) -> tuple[list[str], list[str]]:
+    candidates_by_script = {
+        "cjk": [
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansSC-Regular.otf",
+            "/usr/share/fonts/opentype/source-han-sans/SourceHanSansSC-Regular.otf",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        ],
+        "arabic": [
+            "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
+            "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf",
+            "/usr/share/fonts/opentype/noto/NotoNaskhArabic-Regular.ttf",
+            "/usr/share/fonts/truetype/amiri/amiri-regular.ttf",
+        ],
+        "devanagari": [
+            "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
+            "/usr/share/fonts/truetype/lohit-devanagari/Lohit-Devanagari.ttf",
+        ],
+        "thai": [
+            "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
+            "/usr/share/fonts/truetype/tlwg/Garuda.ttf",
+        ],
+        "hebrew": [
+            "/usr/share/fonts/truetype/noto/NotoSansHebrew-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ],
+        "cyrillic": [
+            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        ],
+        "greek": [
+            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        ],
+    }
+    patterns_by_script = {
+        "cjk": ["*CJK*", "*SourceHan*", "*NotoSansSC*", "*NotoSansJP*", "*NotoSansKR*", "*WenQuan*"],
+        "arabic": ["*Arabic*", "*Naskh*", "*Amiri*", "*Kufi*"],
+        "devanagari": ["*Devanagari*", "*Lohit-Devanagari*", "*Mangal*"],
+        "thai": ["*Thai*", "*Garuda*", "*Laksaman*", "*Tlwg*"],
+        "hebrew": ["*Hebrew*", "*David*", "*Miriam*", "*DejaVuSans.ttf"],
+        "cyrillic": ["*NotoSans-Regular.ttf", "*DejaVuSans.ttf", "*LiberationSans-Regular.ttf"],
+        "greek": ["*NotoSans-Regular.ttf", "*DejaVuSans.ttf", "*LiberationSans-Regular.ttf"],
+    }
+    return candidates_by_script.get(script, []), patterns_by_script.get(script, [])
+
+
+def find_auto_fontfile(required_scripts: set[str] | None = None) -> str | None:
+    required_scripts = required_scripts or set()
+    script_priority = ["cjk", "arabic", "devanagari", "thai", "hebrew", "cyrillic", "greek"]
+    candidate_scripts = [script for script in script_priority if script in required_scripts] or ["cjk", "arabic", "devanagari", "thai", "hebrew", "cyrillic", "greek"]
+    candidates: list[str] = []
+    patterns: list[str] = []
+    for script in candidate_scripts:
+        script_candidates, script_patterns = font_candidates_for_script(script)
+        candidates.extend(script_candidates)
+        patterns.extend(script_patterns)
+    candidates.extend(
+        [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        ]
+    )
     for candidate in candidates:
-        if Path(candidate).exists():
+        if Path(candidate).exists() and (not required_scripts or any(font_name_looks_suitable(candidate, script) for script in required_scripts)):
             return candidate
     for root in ("/usr/share/fonts", str(Path.home() / ".local/share/fonts"), str(Path.home() / ".fonts")):
         root_path = Path(root)
         if not root_path.exists():
             continue
-        for pattern in ("*CJK*", "*SourceHan*", "*NotoSansSC*", "*WenQuan*", "*DejaVuSans.ttf", "*NotoSans-Regular.ttf"):
+        for pattern in patterns or ("*CJK*", "*SourceHan*", "*NotoSansSC*", "*WenQuan*", "*DejaVuSans.ttf", "*NotoSans-Regular.ttf"):
             for candidate in root_path.rglob(pattern):
-                if candidate.suffix.lower() in {".ttf", ".otf", ".ttc"}:
+                candidate_s = str(candidate)
+                if candidate.suffix.lower() in {".ttf", ".otf", ".ttc"} and (
+                    not required_scripts or any(font_name_looks_suitable(candidate_s, script) for script in required_scripts)
+                ):
                     return str(candidate)
     return None
 
 
-def resolve_font_args(fontname: str, fontfile: str | None) -> tuple[str, str | None, list[str]]:
+def resolve_font_args(fontname: str, fontfile: str | None, required_scripts: set[str]) -> tuple[str, str | None, list[str]]:
     warnings: list[str] = []
     resolved_file = fontfile
     if fontfile and fontfile.lower() == "auto":
-        resolved_file = find_auto_fontfile()
+        resolved_file = find_auto_fontfile(required_scripts)
         if resolved_file:
-            warnings.append(f"Using auto-detected fontfile: {resolved_file}")
+            script_note = ", ".join(script_display_name(script) for script in sorted(required_scripts)) or "broad Unicode output"
+            warnings.append(f"Using auto-detected fontfile for {script_note}: {resolved_file}")
         else:
-            warnings.append("--fontfile auto could not find a local broad Unicode font; falling back to built-in font")
+            warnings.append(f"--fontfile auto could not find a local font for this target. {font_install_hint(required_scripts)}")
     if resolved_file and not Path(resolved_file).exists():
         raise SystemExit(f"Font file does not exist: {resolved_file}")
+    if resolved_file:
+        for script in sorted(required_scripts):
+            if not font_name_looks_suitable(resolved_file, script):
+                warnings.append(
+                    f"Font file may not support {script_display_name(script)} glyphs: {resolved_file}. "
+                    f"{font_install_hint({script})}"
+                )
+    complex_scripts = required_scripts & {"arabic", "devanagari", "thai", "hebrew"}
+    if complex_scripts:
+        warnings.append(
+            "Complex-script output may require shaping/ligature support beyond basic glyph coverage; "
+            f"inspect rendered {', '.join(script_display_name(script) for script in sorted(complex_scripts))} text carefully."
+        )
     resolved_name = fontname
     if resolved_file and fontname == "helv":
         # Built-in names ignore fontfile in PyMuPDF; use a custom resource name.
@@ -636,7 +845,13 @@ def insert_fitted_text(
 def apply_translations(input_pdf: str, output_pdf: str, segments: list[Segment], args: argparse.Namespace) -> list[str]:
     require_fitz()
     doc = fitz.open(input_pdf)
-    fontname, fontfile, warnings = resolve_font_args(args.fontname, args.fontfile)
+    required_scripts = required_scripts_for_segments(segments, args.target_language)
+    fontname, fontfile, warnings = resolve_font_args(args.fontname, args.fontfile, required_scripts)
+    if required_scripts and not fontfile:
+        warnings.append(
+            "Translations require non-Latin font support but no usable fontfile was selected. "
+            f"Use --fontfile auto after installing fonts, or pass a known font file. {font_install_hint(required_scripts)}"
+        )
 
     by_page: dict[int, list[Segment]] = {}
     for segment in segments:
