@@ -1,6 +1,6 @@
 ---
 name: pdf-translate
-version: 0.1.4
+version: 0.1.5
 category: docs
 tags:
   - docs
@@ -38,6 +38,45 @@ Use this skill for PDFs where text position matters (figure labels, image annota
    - If the target language or translated text uses Chinese/Japanese/Korean, Arabic, Devanagari/Hindi, Thai, Hebrew, Cyrillic, Greek, or another non-Latin script, install a supporting font and use `--fontfile auto` or pass a known `.ttf/.otf/.ttc` file.
 7. Apply the reviewed JSON with the bundled script to overlay text in-place.
 8. Inspect the output PDF visually and with extraction logs. Re-run with skip rules, glossary improvements, larger `--max-box-scale`, explicit `--redact-pad`, or a better font if labels are mistranslated, clipped, still contain source text, or rendered as missing glyph boxes.
+
+## Simple intent shortcuts
+
+When a user says “把这个 PDF 全部替换成英文” / “translate the whole PDF to English”, the invoking assistant should use the `to-english` preset and should not ask the user to choose layout parameters:
+
+```bash
+python3 scripts/pdf_translate_overlay.py input.pdf translated.pdf \
+  --to-english \
+  --extract-only-json /tmp/pdf-label-translations.json
+```
+
+Then the assistant fills `translation` for every non-skipped segment and applies with the same preset:
+
+```bash
+python3 scripts/pdf_translate_overlay.py input.pdf translated.pdf \
+  --to-english \
+  --translations-json /tmp/pdf-label-translations.json
+```
+
+For English-to-Chinese output, use:
+
+```bash
+python3 scripts/pdf_translate_overlay.py input.pdf translated.pdf \
+  --to-chinese \
+  --extract-only-json /tmp/pdf-label-translations.json
+
+python3 scripts/pdf_translate_overlay.py input.pdf translated.pdf \
+  --to-chinese \
+  --translations-json /tmp/pdf-label-translations.json
+```
+
+Preset defaults:
+
+| Preset | Target/source | Defaults applied |
+| --- | --- | --- |
+| `--to-english` / `--preset zh-to-en` | Chinese → English | `target_language=English`, `source_language=Chinese`, `--max-box-scale 1.2`, `--min-font-size 3.5`, `--fail-on-untranslated`, concise English instructions. |
+| `--to-chinese` / `--preset en-to-zh` | English → Simplified Chinese | `target_language=Simplified Chinese`, `source_language=English`, `--max-box-scale 1.15`, `--min-font-size 4.0`, concise Chinese instructions, automatic Chinese font selection. |
+
+The user-facing instruction can remain simple: “把文本全部替换成英文”. The assistant should run extraction, fill translations, apply the preset, inspect warnings, and only ask the user if OCR/manual cleanup is required.
 
 ## Quick start
 
@@ -236,6 +275,16 @@ For labels where English becomes tiny, the script warns when inserted font size 
 
 The script processes every extracted, non-skipped segment. If one of several identical words remains, it usually means that instance was not extracted as selectable text, was marked skipped, had unchanged/NEEDS_REVIEW translation, or belongs to a PDF structure that redaction did not affect cleanly. Re-run extraction and search all matching `segments[*].text` values by `id` before applying.
 
+## Bundled font support
+
+A skill package can technically carry a Chinese font, but this package does **not** include a font binary by default because CJK fonts are usually large and the distributor must verify license/package-size requirements. Instead, the script supports bundled fonts when present:
+
+- Place licensed `.ttf`, `.otf`, or `.ttc` files under `assets/fonts/` inside the skill.
+- `--fontfile auto` and automatic non-Latin font selection search `assets/fonts/` before system font folders.
+- If a packaged deployment needs offline Chinese output, bundle a licensed font such as Noto Sans CJK / Noto Sans SC / Source Han Sans in `assets/fonts/`, then pack the skill.
+
+If no bundled or system font can render Chinese, the script fails before writing the PDF rather than producing `?` text.
+
 ## Font readiness for non-Latin output
 
 PDF insertion only works well when the selected font contains glyphs for the translated language. Built-in Helvetica is fine for English and many Latin-script targets, but it does not cover Chinese/Japanese/Korean or many other scripts. Before applying translations to a non-Latin target:
@@ -287,7 +336,8 @@ Important options:
 - `--fail-on-untranslated` exits non-zero when QA detects unchanged CJK, CJK left in English output, or `(NEEDS_REVIEW)` markers.
 - `--warn-font-scale 0.6` warns when inserted text shrinks below 60% of source font size.
 - `--redact-fill auto` samples the surrounding background; pass a hex color such as `--redact-fill '#F3F3F3'` when auto sampling is wrong.
-- `--fontfile /path/to/font.ttf` embeds a font that can render non-Latin target languages such as Chinese, Japanese, Korean, Arabic, Devanagari, Thai, Hebrew, Cyrillic, or Greek; if omitted, the script auto-selects a matching local font whenever translated text needs one. `--fontfile auto` makes this explicit.
+- `--preset {to-english,zh-to-en,to-chinese,en-to-zh}`, `--to-english`, and `--to-chinese` apply common replacement defaults so users do not need to choose layout parameters.
+- `--fontfile /path/to/font.ttf` embeds a font that can render non-Latin target languages such as Chinese, Japanese, Korean, Arabic, Devanagari, Thai, Hebrew, Cyrillic, or Greek; if omitted, the script auto-selects a matching bundled/system font whenever translated text needs one. `--fontfile auto` makes this explicit.
 - `--allow-missing-glyphs` bypasses the missing-font failure for debugging only; output may render as `?` or tofu boxes.
 - `--keep-original` overlays translations without removing original text; use only for debugging.
 

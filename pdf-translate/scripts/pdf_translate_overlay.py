@@ -58,6 +58,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("output_pdf", help="Path for translated output PDF")
     parser.add_argument("--target-language", default="English", help="Target language (default: English)")
     parser.add_argument("--source-language", default="auto", help="Source language hint (default: auto)")
+    parser.add_argument(
+        "--preset",
+        choices=("to-english", "zh-to-en", "to-chinese", "en-to-zh"),
+        help="Apply common defaults for full-document replacement, e.g. to-english or to-chinese",
+    )
+    parser.add_argument("--to-english", action="store_true", help="Shortcut for --preset to-english")
+    parser.add_argument("--to-chinese", action="store_true", help="Shortcut for --preset to-chinese")
     parser.add_argument("--model", default=os.getenv("OPENAI_MODEL"), help="Fallback OpenAI-compatible model name")
     parser.add_argument(
         "--base-url",
@@ -114,7 +121,44 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--keep-original", action="store_true", help="Overlay translations without redacting source text")
     parser.add_argument("--temperature", type=float, default=0.1, help="LLM temperature")
     parser.add_argument("--timeout", type=int, default=120, help="LLM HTTP timeout seconds")
-    return parser.parse_args()
+    return apply_preset_defaults(parser.parse_args())
+
+
+def apply_preset_defaults(args: argparse.Namespace) -> argparse.Namespace:
+    preset = args.preset
+    if args.to_english:
+        preset = "to-english"
+    if args.to_chinese:
+        preset = "to-chinese"
+    args.preset = preset
+    if preset in {"to-english", "zh-to-en"}:
+        args.target_language = "English"
+        if args.source_language == "auto":
+            args.source_language = "Chinese"
+        if args.max_box_scale == 1.0:
+            args.max_box_scale = 1.2
+        if args.min_font_size == 5.0:
+            args.min_font_size = 3.5
+        args.fail_on_untranslated = True
+        if not args.instructions:
+            args.instructions = (
+                "Translate all selectable source-language text into concise English. Preserve numbers, units, model names, "
+                "standards, symbols, and intentionally skipped fields. Do not leave Chinese or NEEDS_REVIEW markers in translations."
+            )
+    elif preset in {"to-chinese", "en-to-zh"}:
+        args.target_language = "Simplified Chinese"
+        if args.source_language == "auto":
+            args.source_language = "English"
+        if args.max_box_scale == 1.0:
+            args.max_box_scale = 1.15
+        if args.min_font_size == 5.0:
+            args.min_font_size = 4.0
+        if not args.instructions:
+            args.instructions = (
+                "Translate all selectable source-language text into concise Simplified Chinese. Preserve numbers, units, "
+                "model names, standards, symbols, and intentionally skipped fields."
+            )
+    return args
 
 
 def require_fitz() -> None:
@@ -835,6 +879,26 @@ def font_candidates_for_script(script: str) -> tuple[list[str], list[str]]:
     return candidates_by_script.get(script, []), patterns_by_script.get(script, [])
 
 
+
+
+def bundled_font_dirs() -> list[Path]:
+    skill_root = Path(__file__).resolve().parents[1]
+    return [skill_root / "assets" / "fonts", skill_root / "fonts"]
+
+
+def find_font_in_roots(roots: Iterable[Path], patterns: Iterable[str], required_scripts: set[str]) -> str | None:
+    for root_path in roots:
+        if not root_path.exists():
+            continue
+        for pattern in patterns:
+            for candidate in root_path.rglob(pattern):
+                candidate_s = str(candidate)
+                if candidate.suffix.lower() in {".ttf", ".otf", ".ttc"} and (
+                    not required_scripts or any(font_name_looks_suitable(candidate_s, script) for script in required_scripts)
+                ):
+                    return candidate_s
+    return None
+
 def find_auto_fontfile(required_scripts: set[str] | None = None) -> str | None:
     required_scripts = required_scripts or set()
     script_priority = ["cjk", "arabic", "devanagari", "thai", "hebrew", "cyrillic", "greek"]
@@ -845,6 +909,9 @@ def find_auto_fontfile(required_scripts: set[str] | None = None) -> str | None:
         script_candidates, script_patterns = font_candidates_for_script(script)
         candidates.extend(script_candidates)
         patterns.extend(script_patterns)
+    bundled = find_font_in_roots(bundled_font_dirs(), patterns or ("*.ttf", "*.otf", "*.ttc"), required_scripts)
+    if bundled:
+        return bundled
     candidates.extend(
         [
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -854,17 +921,10 @@ def find_auto_fontfile(required_scripts: set[str] | None = None) -> str | None:
     for candidate in candidates:
         if Path(candidate).exists() and (not required_scripts or any(font_name_looks_suitable(candidate, script) for script in required_scripts)):
             return candidate
-    for root in ("/usr/share/fonts", str(Path.home() / ".local/share/fonts"), str(Path.home() / ".fonts")):
-        root_path = Path(root)
-        if not root_path.exists():
-            continue
-        for pattern in patterns or ("*CJK*", "*SourceHan*", "*NotoSansSC*", "*WenQuan*", "*DejaVuSans.ttf", "*NotoSans-Regular.ttf"):
-            for candidate in root_path.rglob(pattern):
-                candidate_s = str(candidate)
-                if candidate.suffix.lower() in {".ttf", ".otf", ".ttc"} and (
-                    not required_scripts or any(font_name_looks_suitable(candidate_s, script) for script in required_scripts)
-                ):
-                    return str(candidate)
+    system_roots = [Path("/usr/share/fonts"), Path.home() / ".local/share/fonts", Path.home() / ".fonts"]
+    found = find_font_in_roots(system_roots, patterns or ("*CJK*", "*SourceHan*", "*NotoSansSC*", "*WenQuan*", "*DejaVuSans.ttf", "*NotoSans-Regular.ttf"), required_scripts)
+    if found:
+        return found
     return None
 
 

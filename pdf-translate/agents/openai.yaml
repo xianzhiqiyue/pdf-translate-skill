@@ -1,4 +1,4 @@
 interface:
   display_name: "PDF Translate"
   short_description: "Translate PDF labels in-place"
-  default_prompt: "Use $pdf-translate to translate this non-scanned PDF into English while preserving text positions. Use your own AI ability to fill the extracted translations JSON; configure an AI API only if the caller cannot provide translations. For non-Latin output, check font_scripts/font_install_hint; the script auto-selects a matching installed font and fails before writing if none is found, avoiding ? glyph output."
+  default_prompt: "Use $pdf-translate to translate this non-scanned PDF into English while preserving text positions. Use your own AI ability to fill the extracted translations JSON; configure an AI API only if the caller cannot provide translations. For simple full replacement, use --to-english or --to-chinese presets rather than asking users for layout parameters. For non-Latin output, check font_scripts/font_install_hint; the script auto-selects a matching installed font and fails before writing if none is found, avoiding ? glyph output."
