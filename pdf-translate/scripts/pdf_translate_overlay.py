@@ -20,7 +20,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -43,6 +43,7 @@ class Segment:
     skip_reason: str | None = None
     rotation: int = 0
     char_budget: int | None = None
+    review_flags: list[str] = field(default_factory=list)
 
 
 def parse_args() -> argparse.Namespace:
@@ -77,9 +78,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--extract-only-json", help="Write extracted segments as caller-AI translation JSON without calling an LLM or writing a PDF")
     parser.add_argument("--dry-run-json", help="Write extracted + endpoint-translated segments as JSON and do not write PDF")
     parser.add_argument("--translations-json", help="Use reviewed/caller-translated JSON instead of calling an LLM")
-    parser.add_argument("--bbox-pad", type=float, default=0.75, help="Points added around each text bbox")
+    parser.add_argument("--bbox-pad", type=float, default=0.75, help="Points added around each text bbox for insertion")
+    parser.add_argument(
+        "--redact-pad",
+        type=float,
+        help="Points added around each text bbox for redaction. Default: auto, max(--bbox-pad, 18%% of source font size).",
+    )
     parser.add_argument("--max-box-scale", type=float, default=1.0, help="Allow centered bbox expansion for long translations (default: 1.0, no expansion)")
     parser.add_argument("--min-font-size", type=float, default=5.0, help="Smallest font size used to fit translations")
+    parser.add_argument(
+        "--warn-font-scale",
+        type=float,
+        default=0.6,
+        help="Warn when inserted font size is below this ratio of source size (default: 0.6)",
+    )
+    parser.add_argument(
+        "--fail-on-untranslated",
+        action="store_true",
+        help="Exit non-zero if QA detects likely untranslated/NEEDS_REVIEW target text after applying translations",
+    )
     parser.add_argument("--redact-fill", default="auto", help="Hex fill or auto to sample local background (default: auto)")
     parser.add_argument("--fontname", default="helv", help="PDF font resource name for inserted text (default: helv)")
     parser.add_argument(
@@ -171,6 +188,27 @@ def normalize_ws(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def remove_intra_cjk_spaces(text: str) -> str:
+    return re.sub(r"(?<=[\u3400-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af])\s+(?=[\u3400-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af])", "", text)
+
+
+def has_spaced_cjk(text: str) -> bool:
+    return remove_intra_cjk_spaces(text) != text
+
+
+def build_review_flags(text: str, font_size: float, char_budget: int | None) -> list[str]:
+    flags: list[str] = []
+    if has_spaced_cjk(text):
+        flags.append("spaced_cjk: translate by meaning after removing spaces between CJK characters")
+    if char_budget is not None and char_budget <= 12:
+        flags.append("tight_box: keep translation very concise or allow box expansion")
+    if len(text) >= 40:
+        flags.append("long_line: review terminology and fit before applying")
+    if font_size >= 18:
+        flags.append("large_source_font: use larger redaction padding and inspect coverage")
+    return flags
+
+
 def compile_skip_patterns(patterns: Iterable[str]) -> list[re.Pattern[str]]:
     compiled: list[re.Pattern[str]] = []
     for pattern in patterns:
@@ -214,6 +252,7 @@ def extract_segments(pdf_path: str, page_selection: str | None, skip_patterns: l
                 font_size = float(max((span.get("size", 9.0) for span in spans), default=9.0))
                 color = int_color_to_rgb(spans[0].get("color"))
                 rotation = line_rotation(line)
+                char_budget = estimate_char_budget(bbox, font_size, rotation)
                 skipped, reason = should_skip(text, skip_patterns)
                 segments.append(
                     Segment(
@@ -226,7 +265,8 @@ def extract_segments(pdf_path: str, page_selection: str | None, skip_patterns: l
                         skipped=skipped,
                         skip_reason=reason,
                         rotation=rotation,
-                        char_budget=estimate_char_budget(bbox, font_size, rotation),
+                        char_budget=char_budget,
+                        review_flags=build_review_flags(text, font_size, char_budget),
                     )
                 )
                 line_no += 1
@@ -385,6 +425,14 @@ def has_long_lines(segments: list[Segment]) -> bool:
     return any(len(segment.text) >= 40 for segment in segments if not segment.skipped)
 
 
+def has_spaced_cjk_segments(segments: list[Segment]) -> bool:
+    return any(has_spaced_cjk(segment.text) for segment in segments if not segment.skipped)
+
+
+def has_large_source_fonts(segments: list[Segment]) -> bool:
+    return any(segment.font_size >= 18 for segment in segments if not segment.skipped)
+
+
 def build_skip_regex_suggestions(segments: list[Segment]) -> list[str]:
     texts = [segment.text for segment in segments]
     suggestions: list[str] = []
@@ -404,6 +452,8 @@ def recommend_args(segments: list[Segment], target_language: str) -> dict[str, A
     tight = has_tight_boxes(segments)
     long_lines = has_long_lines(segments)
     rotated = has_rotated_segments(segments)
+    spaced_cjk = has_spaced_cjk_segments(segments)
+    large_fonts = has_large_source_fonts(segments)
     source_cjk_ratio = cjk_ratio(segments)
     target_scripts = script_requirements_for_language(target_language)
     target_needs_external_font = bool(target_scripts)
@@ -415,10 +465,14 @@ def recommend_args(segments: list[Segment], target_language: str) -> dict[str, A
         reasons.append("Long technical requirement lines detected; review translations before applying.")
     if rotated:
         reasons.append("Right-angle rotated labels detected; extracted rotation will be reused automatically.")
+    if spaced_cjk:
+        reasons.append("Some CJK text contains spaces between characters; translate by meaning after removing intra-CJK spaces.")
+    if large_fonts:
+        reasons.append("Large source fonts detected; use auto redaction padding and inspect coverage for residual source glyphs.")
     if source_cjk_ratio >= 0.3 and re.search(r"english|英语", target_language, re.I):
         reasons.append("CJK source to English target usually expands text length; use concise terminology and slight box expansion.")
 
-    max_box_scale = 1.1 if (tight or source_cjk_ratio >= 0.3) else 1.0
+    max_box_scale = 1.2 if (tight or source_cjk_ratio >= 0.3 or large_fonts) else 1.0
     if max_box_scale > 1.0:
         reasons.append("Use slight centered box expansion to reduce clipping while keeping label position.")
 
@@ -428,6 +482,7 @@ def recommend_args(segments: list[Segment], target_language: str) -> dict[str, A
         "min_font_size": min_font_size,
         "max_box_scale": max_box_scale,
         "bbox_pad": 0.75,
+        "redact_pad": "auto",
         "fontfile": "auto" if target_needs_external_font else None,
         "font_scripts": sorted(target_scripts),
         "font_install_hint": font_install_hint(target_scripts),
@@ -451,6 +506,31 @@ def write_segments_json(segments: list[Segment], path: str, target_language: str
     Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+
+
+def target_is_english(target_language: str) -> bool:
+    return bool(re.search(r"english|英语|英文", target_language, re.I))
+
+
+def normalized_for_qa(text: str) -> str:
+    return remove_intra_cjk_spaces(normalize_ws(text)).lower()
+
+
+def likely_untranslated_reason(segment: Segment, target_language: str) -> str | None:
+    if segment.skipped:
+        return None
+    translation = normalize_ws(segment.translation or "")
+    source = normalize_ws(segment.text)
+    if not translation:
+        return "missing translation"
+    if "NEEDS_REVIEW" in translation.upper():
+        return "translation still contains NEEDS_REVIEW marker"
+    if target_is_english(target_language) and contains_cjk(source) and contains_cjk(translation):
+        return "target is English but translation still contains CJK characters"
+    if contains_cjk(source) and normalized_for_qa(source) == normalized_for_qa(translation):
+        return "translation is unchanged from CJK source text"
+    return None
+
 def load_segments_json(path: str) -> list[Segment]:
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     items = raw.get("segments") if isinstance(raw, dict) else raw
@@ -466,9 +546,19 @@ def load_segments_json(path: str) -> list[Segment]:
         item["color"] = tuple(item.get("color", (0.0, 0.0, 0.0)))
         item.setdefault("rotation", 0)
         item.setdefault("char_budget", None)
+        item.setdefault("review_flags", build_review_flags(str(item.get("text", "")), float(item.get("font_size", 9.0)), item.get("char_budget")))
         segments.append(Segment(**item))
     return segments
 
+
+
+
+def redact_pad_for_segment(segment: Segment, args: argparse.Namespace) -> float:
+    if args.redact_pad is not None:
+        if args.redact_pad < 0:
+            raise SystemExit("--redact-pad must be >= 0")
+        return args.redact_pad
+    return max(args.bbox_pad, segment.font_size * 0.18)
 
 def padded_rect(bbox: tuple[float, float, float, float], pad: float) -> Any:
     require_fitz()
@@ -863,7 +953,7 @@ def apply_translations(input_pdf: str, output_pdf: str, segments: list[Segment],
             for segment in page_segments:
                 if segment.skipped:
                     continue
-                rect = padded_rect(segment.bbox, args.bbox_pad)
+                rect = padded_rect(segment.bbox, redact_pad_for_segment(segment, args))
                 page.add_redact_annot(rect, fill=redact_fill_for(page, rect, args.redact_fill))
             page.apply_redactions()
 
@@ -873,6 +963,9 @@ def apply_translations(input_pdf: str, output_pdf: str, segments: list[Segment],
             if segment.skipped:
                 continue
             translation = segment.translation or segment.text
+            untranslated_reason = likely_untranslated_reason(segment, args.target_language)
+            if untranslated_reason:
+                warnings.append(f"{segment.id}: QA possible untranslated text: {untranslated_reason}; source={segment.text!r}; translation={translation!r}")
             rect = padded_rect(segment.bbox, args.bbox_pad)
             if contains_non_latin(translation) and not fontfile:
                 warnings.append(
@@ -896,6 +989,11 @@ def apply_translations(input_pdf: str, output_pdf: str, segments: list[Segment],
             )
             if used_scale > 1.0:
                 warnings.append(f"{segment.id}: expanded box around original center by {used_scale:.2f}x to fit translation")
+            if segment.font_size > 0 and used_size / segment.font_size < args.warn_font_scale:
+                warnings.append(
+                    f"{segment.id}: inserted font shrank to {used_size:.1f}pt from source {segment.font_size:.1f}pt; "
+                    "shorten the translation or increase --max-box-scale to avoid tiny overlapping-looking labels"
+                )
             if not ok:
                 warnings.append(
                     f"{segment.id}: translation may not fit box at min font size {used_size}: {translation!r}"
@@ -904,6 +1002,12 @@ def apply_translations(input_pdf: str, output_pdf: str, segments: list[Segment],
     Path(output_pdf).parent.mkdir(parents=True, exist_ok=True)
     doc.save(output_pdf, garbage=4, deflate=True)
     doc.close()
+    if args.fail_on_untranslated:
+        failures = [warning for warning in warnings if "QA possible untranslated text" in warning]
+        if failures:
+            for warning in warnings:
+                print(f"WARNING: {warning}", file=sys.stderr)
+            raise SystemExit(f"QA detected {len(failures)} likely untranslated segments; fix translations JSON and rerun")
     return warnings
 
 
