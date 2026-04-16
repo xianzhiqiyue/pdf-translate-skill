@@ -1,6 +1,6 @@
 ---
 name: pdf-translate
-version: 0.1.3
+version: 0.1.4
 category: docs
 tags:
   - docs
@@ -242,8 +242,9 @@ PDF insertion only works well when the selected font contains glyphs for the tra
 
 1. Read `recommended_args.font_scripts` and `recommended_args.font_install_hint` in the extraction JSON.
 2. Install an appropriate font if the machine does not already have one.
-3. Apply with `--fontfile auto`, or pass a known font path.
-4. Inspect the output PDF for tofu boxes (`□`), missing glyphs, incorrect shaping, or clipped text.
+3. Apply normally; the script auto-selects a matching local font when translated text is non-Latin. You may still pass `--fontfile auto` or a known font path to be explicit.
+4. If no matching font is found, the script now fails before writing the PDF instead of generating `?` / tofu-box output. Only use `--allow-missing-glyphs` for debugging.
+5. Inspect the output PDF for tofu boxes (`□`), missing glyphs, incorrect shaping, or clipped text.
 
 Examples:
 
@@ -254,10 +255,9 @@ sudo apt-get update && sudo apt-get install -y fonts-noto-cjk
 # Ubuntu/Debian, broad non-Latin coverage such as Arabic/Hebrew/Cyrillic/Greek
 sudo apt-get update && sudo apt-get install -y fonts-noto-core fonts-noto-extra
 
-# Apply after installing fonts
+# Apply after installing fonts; --fontfile auto is optional because non-Latin text auto-selects a matching font
 python3 scripts/pdf_translate_overlay.py input.pdf translated.pdf \
-  --translations-json /tmp/pdf-label-translations.json \
-  --fontfile auto
+  --translations-json /tmp/pdf-label-translations.json
 ```
 
 For manual font selection, use a real font file such as:
@@ -269,7 +269,7 @@ For manual font selection, use a real font file such as:
 - Hebrew: Noto Sans Hebrew or DejaVu Sans.
 - Cyrillic/Greek: Noto Sans, DejaVu Sans, or Liberation Sans.
 
-If `--fontfile auto` cannot find a suitable font, the script prints installation hints and still writes the PDF; treat that output as needing manual inspection or rerun after installing fonts.
+If the script cannot find a suitable font for non-Latin translated text, it refuses to write the PDF so it does not create `?` output. Install the hinted font package and rerun, pass an explicit `--fontfile`, or override only for debugging with `--allow-missing-glyphs`.
 
 ## Position-preservation guidance
 
@@ -287,7 +287,8 @@ Important options:
 - `--fail-on-untranslated` exits non-zero when QA detects unchanged CJK, CJK left in English output, or `(NEEDS_REVIEW)` markers.
 - `--warn-font-scale 0.6` warns when inserted text shrinks below 60% of source font size.
 - `--redact-fill auto` samples the surrounding background; pass a hex color such as `--redact-fill '#F3F3F3'` when auto sampling is wrong.
-- `--fontfile /path/to/font.ttf` embeds a font that can render non-Latin target languages such as Chinese, Japanese, Korean, Arabic, Devanagari, Thai, Hebrew, Cyrillic, or Greek; `--fontfile auto` tries local script-specific fonts and prints install hints when none are found.
+- `--fontfile /path/to/font.ttf` embeds a font that can render non-Latin target languages such as Chinese, Japanese, Korean, Arabic, Devanagari, Thai, Hebrew, Cyrillic, or Greek; if omitted, the script auto-selects a matching local font whenever translated text needs one. `--fontfile auto` makes this explicit.
+- `--allow-missing-glyphs` bypasses the missing-font failure for debugging only; output may render as `?` or tofu boxes.
 - `--keep-original` overlays translations without removing original text; use only for debugging.
 
 Read `references/pdf-positioning.md` before handling dense figures, colored backgrounds, vertical labels, or documents with strict publication-quality layout requirements.
@@ -298,7 +299,7 @@ Read `references/pdf-positioning.md` before handling dense figures, colored back
 - Rotated/vertical labels: the script now detects line direction and preserves 0/90/180/270-degree rotation when inserting translations. Inspect arbitrary-angle text manually because PDF text boxes only support right-angle insertion.
 - Long translations: each segment includes a per-label `char_budget` estimate. Use concise glossary entries, keep caller-generated translations short, edit translations manually, lower `--min-font-size` if fit matters more than readability, or allow bounded expansion with `--max-box-scale 1.2` to `1.4` to keep the label centered on the original position.
 - Residual source glyphs: increase `--redact-pad` or inspect `review_flags` for large fonts/tight boxes.
-- Missing glyphs: pass `--fontfile /path/to/NotoSansCJK-Regular.ttc` or `--fontfile auto` for non-Latin targets. If warnings say the selected font may not cover the target script, install/use a matching font and rerun from the reviewed JSON.
+- Missing glyphs / question marks: the script should auto-select a matching font for non-Latin translations and fail if none is available. If you still see `?`, rerun with an explicit `--fontfile /path/to/NotoSansCJK-Regular.ttc` (or another matching font), and do not use `--allow-missing-glyphs` for production output.
 - Exact typography: the script preserves placement and color, not the source font. For final print layout, inspect and optionally post-edit high-value pages.
 
 ## Validation checklist

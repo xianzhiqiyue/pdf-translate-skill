@@ -97,6 +97,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Exit non-zero if QA detects likely untranslated/NEEDS_REVIEW target text after applying translations",
     )
+    parser.add_argument(
+        "--allow-missing-glyphs",
+        action="store_true",
+        help="Allow writing non-Latin translations without a detected supporting font. Not recommended: output may render as ? or tofu boxes.",
+    )
     parser.add_argument("--redact-fill", default="auto", help="Hex fill or auto to sample local background (default: auto)")
     parser.add_argument("--fontname", default="helv", help="PDF font resource name for inserted text (default: helv)")
     parser.add_argument(
@@ -863,16 +868,33 @@ def find_auto_fontfile(required_scripts: set[str] | None = None) -> str | None:
     return None
 
 
-def resolve_font_args(fontname: str, fontfile: str | None, required_scripts: set[str]) -> tuple[str, str | None, list[str]]:
+def resolve_font_args(
+    fontname: str,
+    fontfile: str | None,
+    required_scripts: set[str],
+    allow_missing_glyphs: bool = False,
+) -> tuple[str, str | None, list[str]]:
     warnings: list[str] = []
+    requested_auto = bool(fontfile and fontfile.lower() == "auto")
+    should_auto_detect = requested_auto or (required_scripts and not fontfile)
     resolved_file = fontfile
-    if fontfile and fontfile.lower() == "auto":
+    if should_auto_detect:
         resolved_file = find_auto_fontfile(required_scripts)
+        script_note = ", ".join(script_display_name(script) for script in sorted(required_scripts)) or "broad Unicode output"
         if resolved_file:
-            script_note = ", ".join(script_display_name(script) for script in sorted(required_scripts)) or "broad Unicode output"
-            warnings.append(f"Using auto-detected fontfile for {script_note}: {resolved_file}")
-        else:
-            warnings.append(f"--fontfile auto could not find a local font for this target. {font_install_hint(required_scripts)}")
+            prefix = "Using auto-detected" if requested_auto else "Auto-selected"
+            warnings.append(f"{prefix} fontfile for {script_note}: {resolved_file}")
+        elif requested_auto or required_scripts:
+            message = (
+                "No local font was found for non-Latin translated text. Refusing to write a PDF that would likely "
+                f"render as '?' or tofu boxes. {font_install_hint(required_scripts)} "
+                "Install a supporting font and rerun, or pass --allow-missing-glyphs to override."
+            )
+            if allow_missing_glyphs:
+                warnings.append(message)
+                resolved_file = None
+            else:
+                raise SystemExit(message)
     if resolved_file and not Path(resolved_file).exists():
         raise SystemExit(f"Font file does not exist: {resolved_file}")
     if resolved_file:
@@ -936,10 +958,12 @@ def apply_translations(input_pdf: str, output_pdf: str, segments: list[Segment],
     require_fitz()
     doc = fitz.open(input_pdf)
     required_scripts = required_scripts_for_segments(segments, args.target_language)
-    fontname, fontfile, warnings = resolve_font_args(args.fontname, args.fontfile, required_scripts)
-    if required_scripts and not fontfile:
+    fontname, fontfile, warnings = resolve_font_args(
+        args.fontname, args.fontfile, required_scripts, allow_missing_glyphs=args.allow_missing_glyphs
+    )
+    if required_scripts and not fontfile and args.allow_missing_glyphs:
         warnings.append(
-            "Translations require non-Latin font support but no usable fontfile was selected. "
+            "Translations require non-Latin font support but no usable fontfile was selected; output may render as '?' or tofu boxes. "
             f"Use --fontfile auto after installing fonts, or pass a known font file. {font_install_hint(required_scripts)}"
         )
 
